@@ -19,6 +19,7 @@ package org.keycloak.timer.basic;
 
 import org.jboss.logging.Logger;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.common.util.Time;
 import org.keycloak.services.scheduled.ScheduledTaskRunner;
 import org.keycloak.timer.ScheduledTask;
 import org.keycloak.timer.TimerProvider;
@@ -47,14 +48,15 @@ public class BasicTimerProvider implements TimerProvider {
 
     @Override
     public void schedule(final Runnable runnable, final long intervalMillis, String taskName) {
+        Runnable wrapped = Time.wrap(runnable);
         TimerTask task = new TimerTask() {
             @Override
             public void run() {
-                runnable.run();
+                wrapped.run();
             }
         };
 
-        TimerTaskContextImpl taskContext = new TimerTaskContextImpl(runnable, task, intervalMillis);
+        TimerTaskContextImpl taskContext = new TimerTaskContextImpl(wrapped, task, intervalMillis);
         TimerTaskContextImpl existingTask = factory.putTask(taskName, taskContext);
         if (existingTask != null) {
             logger.debugf("Existing timer task '%s' found. Cancelling it", taskName);
@@ -63,6 +65,7 @@ public class BasicTimerProvider implements TimerProvider {
 
         logger.debugf("Starting task '%s' with interval '%d'", taskName, intervalMillis);
         timer.schedule(task, intervalMillis, intervalMillis);
+
     }
 
     @Override

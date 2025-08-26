@@ -1009,6 +1009,7 @@ public class TokenManager {
 
     private Long getTokenExpiration(RealmModel realm, ClientModel client, UserSessionModel userSession,
         AuthenticatedClientSessionModel clientSession, boolean offlineTokenRequested) {
+        try (AutoCloseable ignored = Time.withOffset(0)) {
         boolean implicitFlow = false;
         String responseType = clientSession.getNote(OIDCLoginProtocol.RESPONSE_TYPE_PARAM);
         if (responseType != null) {
@@ -1048,7 +1049,8 @@ public class TokenManager {
         expiration = sessionExpires > 0? Math.min(expiration, sessionExpires) : expiration;
 
         return TimeUnit.MILLISECONDS.toSeconds(expiration);
-    }
+        }
+}
 
 
     public AccessTokenResponseBuilder responseBuilder(RealmModel realm, ClientModel client, EventBuilder event, KeycloakSession session,
