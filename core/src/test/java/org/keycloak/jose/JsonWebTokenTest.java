@@ -27,6 +27,7 @@ import java.io.IOException;
 import static junit.framework.TestCase.assertFalse;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertEquals;
 
 /**
  * Created by st on 20.08.15.
@@ -114,6 +115,30 @@ public class JsonWebTokenTest {
         JsonWebToken jsonWebToken = new JsonWebToken();
         jsonWebToken.nbf(notBeforeTime);
         assertFalse(jsonWebToken.isActive(allowedClockSkew));
+    }
+
+    @Test
+    public void scopedOffsetsAccumulateAndRestore() {
+        int baseline = Time.currentTime();
+        try (Time.OffsetScope s1 = Time.withOffset(5)) {
+            assertEquals(baseline + 5, Time.currentTime());
+            try (Time.OffsetScope s2 = Time.withOffset(7)) {
+                assertEquals(baseline + 12, Time.currentTime());
+            }
+            assertEquals(baseline + 5, Time.currentTime());
+        }
+        assertEquals(baseline, Time.currentTime());
+    }
+
+    @Test
+    public void wrappedRunnablePropagatesOffset() {
+        int baseline = Time.currentTime();
+        Runnable wrapped;
+        try (Time.OffsetScope s = Time.withOffset(33)) {
+            wrapped = Time.wrap(() -> assertEquals(baseline + 33, Time.currentTime()));
+        }
+        wrapped.run();
+        assertEquals(baseline, Time.currentTime());
     }
 
 }
