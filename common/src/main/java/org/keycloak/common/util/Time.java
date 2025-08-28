@@ -17,29 +17,136 @@
 
 package org.keycloak.common.util;
 
+import java.util.ArrayDeque;
 import java.util.Date;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicLong;
+
+import org.jboss.logging.Logger;
 
 /**
+ * Utility providing current time with support for temporary thread based offsets.  The
+ * implementation keeps backwards compatibility with the historical global offset while
+ * allowing additional offsets to be applied on a per thread basis using
+ * {@link #withTemporaryOffset(int)}.  Offsets are stacked and propagated to child threads
+ * through {@link InheritableThreadLocal}.
+ *
+ * <p>The implementation favours safety – stack manipulations are validated and attempts to
+ * close offsets out of order will result in an {@link IllegalStateException}.</p>
+ *
  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
  */
 public class Time {
 
+    private static final Logger LOG = Logger.getLogger(Time.class);
+
+    /** Global offset shared by all threads (for backwards compatibility). */
     private static volatile int offset;
 
     /**
-     * Returns current time in seconds adjusted by adding {@link #offset) seconds.
-     * @return see description
+     * Flag enabling optional synchronised blocks while computing sums.  Intended only for
+     * debugging and simulating potential race conditions.
      */
-    public static int currentTime() {
-        return ((int) (System.currentTimeMillis() / 1000)) + offset;
+    private static final boolean DEBUG_SYNCHRONIZED = Boolean.getBoolean("keycloak.time.debug");
+
+    /** Sequence for creating unique identifiers for offset contexts. */
+    private static final AtomicLong IDS = new AtomicLong();
+
+    /** Stack of offset contexts per thread. */
+    private static final InheritableThreadLocal<Deque<OffsetContext>> OFFSETS =
+            new InheritableThreadLocal<Deque<OffsetContext>>() {
+                @Override
+                protected Deque<OffsetContext> initialValue() {
+                    return new ArrayDeque<>();
+                }
+
+                @Override
+                protected Deque<OffsetContext> childValue(Deque<OffsetContext> parent) {
+                    Deque<OffsetContext> clone = new ArrayDeque<>();
+                    for (OffsetContext c : parent) {
+                        clone.addLast(c.copyForChild());
+                    }
+                    return clone;
+                }
+            };
+
+    /** Set of context identifiers per thread used to detect duplicates. */
+    private static final InheritableThreadLocal<Set<Long>> CONTEXT_IDS =
+            new InheritableThreadLocal<Set<Long>>() {
+                @Override
+                protected Set<Long> initialValue() {
+                    return new HashSet<>();
+                }
+
+                @Override
+                protected Set<Long> childValue(Set<Long> parent) {
+                    return new HashSet<>(parent);
+                }
+            };
+
+    /** Cache for the summed thread local offsets. */
+    private static final InheritableThreadLocal<SumHolder> SUM_CACHE =
+            new InheritableThreadLocal<SumHolder>() {
+                @Override
+                protected SumHolder initialValue() {
+                    return new SumHolder();
+                }
+
+                @Override
+                protected SumHolder childValue(SumHolder parent) {
+                    // Child threads start with the same value but mark as invalid to force recompute
+                    SumHolder holder = new SumHolder();
+                    holder.sum = parent.sum;
+                    holder.valid = false;
+                    return holder;
+                }
+            };
+
+    /** Holder for cached sums. */
+    private static final class SumHolder {
+        volatile int sum;
+        volatile boolean valid;
+    }
+
+    /** Context representing a single offset pushed on the stack. */
+    private static final class OffsetContext {
+        final long id;
+        final int offset;
+        final int previousSum;
+        boolean closed;
+
+        OffsetContext(int offset, int previousSum) {
+            this.id = IDS.incrementAndGet();
+            this.offset = offset;
+            this.previousSum = previousSum;
+        }
+
+        OffsetContext copyForChild() {
+            OffsetContext c = new OffsetContext(this.offset, this.previousSum);
+            c.closed = this.closed;
+            return c;
+        }
     }
 
     /**
-     * Returns current time in milliseconds adjusted by adding {@link #offset) seconds.
-     * @return see description
+     * Returns current time in seconds adjusted by adding global and thread local offsets.
+     */
+    public static int currentTime() {
+        long base = System.currentTimeMillis() / 1000L;
+        int total = safeAdd(offset, threadLocalSum());
+        return safeAdd((int) base, total);
+    }
+
+    /**
+     * Returns current time in milliseconds adjusted by adding global and thread local offsets.
      */
     public static long currentTimeMillis() {
-        return System.currentTimeMillis() + (offset * 1000L);
+        long base = System.currentTimeMillis();
+        int total = safeAdd(offset, threadLocalSum());
+        return base + (total * 1000L);
     }
 
     /**
@@ -84,4 +191,140 @@ public class Time {
         Time.offset = offset;
     }
 
+    // -------------------------------------------------------------------------------------
+    //  Thread local offset handling
+    // -------------------------------------------------------------------------------------
+
+    /**
+     * Apply a temporary offset for the current thread.  The returned {@link AutoCloseable}
+     * must be closed (typically using try-with-resources) to remove the offset again.
+     *
+     * @param seconds the offset to apply
+     * @return handle used for closing the offset
+     */
+    public static AutoCloseable withTemporaryOffset(int seconds) {
+        if (seconds == 0) {
+            return () -> {
+                // no-op for zero offsets
+            };
+        }
+
+        Deque<OffsetContext> stack = OFFSETS.get();
+        SumHolder holder = SUM_CACHE.get();
+        int previous = threadLocalSum();
+
+        OffsetContext ctx = new OffsetContext(seconds, previous);
+        if (!CONTEXT_IDS.get().add(ctx.id)) {
+            throw new IllegalStateException("Duplicate offset context");
+        }
+
+        stack.addLast(ctx);
+        holder.sum = safeAdd(previous, seconds);
+        holder.valid = true;
+
+        return new AutoCloseable() {
+            private boolean closed;
+
+            @Override
+            public void close() {
+                if (closed) {
+                    LOG.debugf("Offset context %d already closed. Stack=%s", ctx.id, stack);
+                    return;
+                }
+                closed = true;
+                removeContext(ctx);
+            }
+        };
+    }
+
+    /** Removes the provided context from the current stack performing validation. */
+    private static void removeContext(OffsetContext ctx) {
+        Deque<OffsetContext> stack = OFFSETS.get();
+        if (stack.isEmpty()) {
+            return;
+        }
+
+        OffsetContext top = stack.peekLast();
+        if (top == ctx) {
+            stack.removeLast();
+        } else if (stack.remove(ctx)) {
+            // out of order close – remove and signal misuse
+            CONTEXT_IDS.get().remove(ctx.id);
+            SUM_CACHE.get().valid = false;
+            throw new IllegalStateException("Offset contexts closed out of order");
+        } else {
+            // nothing to remove
+            return;
+        }
+
+        CONTEXT_IDS.get().remove(ctx.id);
+        SUM_CACHE.get().valid = false;
+    }
+
+    /** Compute the sum of thread local offsets caching the result. */
+    private static int threadLocalSum() {
+        SumHolder holder = SUM_CACHE.get();
+        if (!holder.valid) {
+            holder.sum = recomputeThreadLocalSum();
+            holder.valid = true;
+        }
+        return holder.sum;
+    }
+
+    /** Recompute the sum, optionally synchronised when debugging is enabled. */
+    private static int recomputeThreadLocalSum() {
+        Deque<OffsetContext> stack = OFFSETS.get();
+        int sum = 0;
+        if (DEBUG_SYNCHRONIZED) {
+            synchronized (stack) {
+                for (OffsetContext c : stack) {
+                    sum = safeAdd(sum, c.offset);
+                }
+            }
+        } else {
+            for (OffsetContext c : stack) {
+                sum = safeAdd(sum, c.offset);
+            }
+        }
+        return sum;
+    }
+
+    /** Saturating add protecting against integer overflow. */
+    private static int safeAdd(int a, int b) {
+        long r = (long) a + (long) b;
+        if (r > Integer.MAX_VALUE) return Integer.MAX_VALUE;
+        if (r < Integer.MIN_VALUE) return Integer.MIN_VALUE;
+        return (int) r;
+    }
+
+    // -------------------------------------------------------------------------------------
+    //  Wrappers
+    // -------------------------------------------------------------------------------------
+
+    /**
+     * Wrap a runnable so that the current offset stack is applied while it runs.
+     */
+    public static Runnable wrapWithOffset(Runnable r) {
+        int sum = threadLocalSum();
+        return () -> {
+            try (AutoCloseable ignored = withTemporaryOffset(sum)) {
+                r.run();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        };
+    }
+
+    /**
+     * Wrap a callable so that the current offset stack is applied while it runs.
+     */
+    public static <T> Callable<T> wrapWithOffset(Callable<T> c) {
+        int sum = threadLocalSum();
+        return () -> {
+            try (AutoCloseable ignored = withTemporaryOffset(sum)) {
+                return c.call();
+            }
+        };
+    }
 }
+
