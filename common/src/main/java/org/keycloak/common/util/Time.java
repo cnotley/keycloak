@@ -18,28 +18,79 @@
 package org.keycloak.common.util;
 
 import java.util.Date;
+import java.util.Deque;
+import java.util.ArrayDeque;
 
 /**
  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
  */
 public class Time {
-
+    /**
+     * Global baseline offset shared by all threads. This behaves as the legacy offset and is applied to all threads in addition
+     * to any active thread-local offsets. Tests that want to advance or rewind time globally may continue to manipulate this
+     * offset, although doing so can still cause issues in highly concurrent environments.
+     */
     private static volatile int offset;
 
     /**
-     * Returns current time in seconds adjusted by adding {@link #offset) seconds.
-     * @return see description
+     * Thread-local stack of temporary offsets. Inheritable so that child threads start with a copy of their parent's
+     * offset stack, preserving the parent's view of time at creation. Any adjustments made in a child thereafter are
+     * independent of other threads.  The stack always has at least a single entry representing the current thread's
+     * local overlay to the global offset. A value of 0 indicates no additional thread-local adjustment relative to the
+     * global baseline.
      */
-    public static int currentTime() {
-        return ((int) (System.currentTimeMillis() / 1000)) + offset;
+    private static final InheritableThreadLocal<Deque<OffsetHolder>> localOffsets = new InheritableThreadLocal<Deque<OffsetHolder>>() {
+        @Override
+        protected Deque<OffsetHolder> initialValue() {
+            ArrayDeque<OffsetHolder> deque = new ArrayDeque<>();
+            deque.add(new OffsetHolder(0));
+            return deque;
+        }
+
+        @Override
+        protected Deque<OffsetHolder> childValue(Deque<OffsetHolder> parentValue) {
+            return new ArrayDeque<>(parentValue);
+        }
+    };
+
+    private static final boolean DEBUG = Boolean.getBoolean("keycloak.time.offset.debug");
+    private static final int MAX_STACK_DEPTH = 1000;
+
+    private static class OffsetHolder {
+        final int offset;
+        OffsetHolder(int offset) {
+            this.offset = offset;
+        }
     }
 
     /**
-     * Returns current time in milliseconds adjusted by adding {@link #offset) seconds.
-     * @return see description
+     * @return current time in seconds adjusted by adding {@link #offset} plus any active thread-local offsets.
+     */
+    public static int currentTime() {
+        long base = System.currentTimeMillis() / 1000L;
+        long total = base + offset + currentThreadOffset();
+        if (DEBUG) {
+            if (total > Integer.MAX_VALUE || total < Integer.MIN_VALUE) {
+                throw new IllegalStateException("Adjusted time seconds overflow: " + total);
+            }
+        }
+        return (int) total;
+    }
+
+    /**
+     * @return current time in milliseconds adjusted by adding {@link #offset} plus any active thread-local offsets.
      */
     public static long currentTimeMillis() {
-        return System.currentTimeMillis() + (offset * 1000L);
+        long threadOffset = offset + currentThreadOffset();
+        long millis = System.currentTimeMillis();
+        long result = millis + threadOffset * 1000L;
+        if (DEBUG) {
+            // detect overflow of signed long
+            if ((threadOffset > 0 && result < millis) || (threadOffset < 0 && result > millis)) {
+                throw new IllegalStateException("Adjusted time millis overflow: " + result);
+            }
+        }
+        return result;
     }
 
     /**
@@ -70,18 +121,56 @@ public class Time {
     }
 
     /**
-     * @return Time offset in seconds that will be added to {@link #currentTime()} and {@link #currentTimeMillis()}.
+     * @return current effective time offset for this thread, which is the sum of the global baseline offset
+     * and any active thread-local overlay.
      */
     public static int getOffset() {
-        return offset;
+        return offset + currentThreadOffset();
     }
 
     /**
      * Sets time offset in seconds that will be added to {@link #currentTime()} and {@link #currentTimeMillis()}.
+     * Adjusts the global baseline offset that applies to all threads. Tests that require isolated adjustments should use
+     * {@link #withThreadOffset(int)} to avoid interfering with other threads.
+     *
      * @param offset Offset (in seconds)
      */
     public static void setOffset(int offset) {
         Time.offset = offset;
+    }
+
+    /**
+     * Push a thread-local offset adjustment for the current thread and any subsequently created child threads.
+     * The returned {@link AutoCloseable} must be closed to restore the previous offset once the temporary adjustment
+     * is no longer needed. Adjustments are stacked to support nesting.
+     *
+     * @param offsetSeconds absolute offset, in seconds, relative to the global baseline. To apply a relative adjustment,
+     * callers should calculate the desired absolute offset (for example, current offset + delta).
+     */
+    public static AutoCloseable withThreadOffset(int offsetSeconds) {
+        Deque<OffsetHolder> stack = localOffsets.get();
+        if (DEBUG && stack.size() > MAX_STACK_DEPTH) {
+            throw new IllegalStateException("Time offset nesting too deep: " + stack.size());
+        }
+        final OffsetHolder holder = new OffsetHolder(offsetSeconds);
+        stack.addLast(holder);
+        return () -> {
+            Deque<OffsetHolder> s = localOffsets.get();
+            if (DEBUG) {
+                // Ensure we are unwinding in LIFO order
+                OffsetHolder top = s.peekLast();
+                if (top != holder) {
+                    throw new IllegalStateException("Time offset contexts closed out of order");
+                }
+            }
+            s.removeLast();
+        };
+    }
+
+    private static int currentThreadOffset() {
+        Deque<OffsetHolder> s = localOffsets.get();
+        OffsetHolder top = s.peekLast();
+        return top == null ? 0 : top.offset;
     }
 
 }
