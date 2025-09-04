@@ -8,6 +8,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import static org.junit.Assert.*;
 import org.keycloak.common.util.Time;
 
@@ -60,6 +62,44 @@ public class HeldOutTimeMechanismTest {
     @FunctionalInterface
     private interface ThrowingRunnable {
         void run() throws Exception;
+    }
+
+    private static AutoCloseable enableDebug() {
+        String originalProp = System.getProperty("keycloak.time.offset.debug");
+        boolean original = getDebugField();
+        System.setProperty("keycloak.time.offset.debug", "true");
+        setDebugField(true);
+        return () -> {
+            setDebugField(original);
+            if (originalProp == null) {
+                System.clearProperty("keycloak.time.offset.debug");
+            } else {
+                System.setProperty("keycloak.time.offset.debug", originalProp);
+            }
+        };
+    }
+
+    private static boolean getDebugField() {
+        try {
+            Field f = Time.class.getDeclaredField("DEBUG");
+            f.setAccessible(true);
+            return f.getBoolean(null);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void setDebugField(boolean val) {
+        try {
+            Field f = Time.class.getDeclaredField("DEBUG");
+            f.setAccessible(true);
+            Field m = Field.class.getDeclaredField("modifiers");
+            m.setAccessible(true);
+            m.setInt(f, f.getModifiers() & ~Modifier.FINAL);
+            f.set(null, val);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
     @Test
     public void testNoImpactOnUnrelatedThreads() throws Exception {
@@ -255,20 +295,41 @@ public class HeldOutTimeMechanismTest {
     @Test
     public void testDetectionOfAllInconsistenciesInNestedAdjustments() throws Exception {
         runInNewThread(() -> {
-            AutoCloseable outer = Time.withThreadOffset(10);
-            AutoCloseable inner = Time.withThreadOffset(10);
-            try {
-                boolean threw = false;
+            try (AutoCloseable debug = enableDebug()) {
+                AutoCloseable outer = Time.withThreadOffset(10);
+                AutoCloseable inner = Time.withThreadOffset(10);
                 try {
-                    outer.close(); 
-                } catch (IllegalStateException expected) {
-                    threw = true;
+                    assertThrows(IllegalStateException.class, outer::close);
+                } finally {
+                    closeQuietly(inner);
+                    closeQuietly(outer);
                 }
-                assertTrue("Out-of-order close must be detected even when values are identical", threw);
-            } finally {
-                closeQuietly(inner);
-                closeQuietly(outer);
+                assertEffectiveOffsetSeconds(0);
+
+                outer = Time.withThreadOffset(5);
+                inner = Time.withThreadOffset(15);
+                try {
+                    assertThrows(IllegalStateException.class, outer::close);
+                } finally {
+                    closeQuietly(inner);
+                    closeQuietly(outer);
+                }
+                assertEffectiveOffsetSeconds(0);
             }
+
+            AutoCloseable outerNoDebug = Time.withThreadOffset(10);
+            AutoCloseable innerNoDebug = Time.withThreadOffset(10);
+            try {
+                try {
+                    outerNoDebug.close();
+                } catch (IllegalStateException e) {
+                    fail("Should not throw in non-debug");
+                }
+            } finally {
+                closeQuietly(innerNoDebug);
+                closeQuietly(outerNoDebug);
+            }
+            assertEffectiveOffsetSeconds(0);
         });
     }
     
@@ -293,33 +354,56 @@ public class HeldOutTimeMechanismTest {
     @Test
     public void testIndicationOfImproperUsageForAllIssues() throws Exception {
         runInNewThread(() -> {
-            AutoCloseable outer = Time.withThreadOffset(10);
-            AutoCloseable inner = Time.withThreadOffset(10);
-            boolean threw = false;
-            try {
-                inner.close(); 
-                inner.close(); 
-            } catch (IllegalStateException expected) {
-                threw = true;
-            } finally {
-                closeQuietly(outer); 
+            try (AutoCloseable debug = enableDebug()) {
+                AutoCloseable outer = Time.withThreadOffset(10);
+                AutoCloseable inner = Time.withThreadOffset(10);
+                inner.close();
+                assertThrows(IllegalStateException.class, inner::close);
+                closeQuietly(outer);
+                assertEffectiveOffsetSeconds(0);
+
+                AutoCloseable single = Time.withThreadOffset(10);
+                single.close();
+                assertThrows(IllegalStateException.class, single::close);
+                assertEffectiveOffsetSeconds(0);
             }
-            assertTrue("Closing the same scope twice must be a failure in debug mode", threw);
+
+            AutoCloseable innerNoDebug = Time.withThreadOffset(10);
+            innerNoDebug.close();
+            try {
+                innerNoDebug.close();
+            } catch (IllegalStateException e) {
+                fail("Should not throw in non-debug");
+            }
+            assertEffectiveOffsetSeconds(0);
+            closeQuietly(innerNoDebug);
         });
     }
     @Test
     public void testIdempotentRepeatedClosesWithoutDrifts() throws Exception {
-        AutoCloseable scope = Time.withThreadOffset(0);
-        try {
+        AutoCloseable scope = Time.withThreadOffset(5);
+        assertEffectiveOffsetSeconds(5);
+        scope.close();
+        assertEffectiveOffsetSeconds(0);
+        scope.close();
+        assertEffectiveOffsetSeconds(0);
+
+        AutoCloseable outer = Time.withThreadOffset(3);
+        AutoCloseable inner = Time.withThreadOffset(7);
+        assertEffectiveOffsetSeconds(7);
+        inner.close();
+        assertEffectiveOffsetSeconds(3);
+        inner.close();
+        assertEffectiveOffsetSeconds(3);
+        outer.close();
+        assertEffectiveOffsetSeconds(0);
+
+        try (AutoCloseable debug = enableDebug()) {
+            scope = Time.withThreadOffset(5);
             scope.close();
-            try {
-                scope.close();
-            } catch (Throwable ignored) {
-            }
-            assertEffectiveOffsetSeconds(0);
-        } finally {
-            closeQuietly(scope);
+            assertThrows(IllegalStateException.class, scope::close);
         }
+        assertEffectiveOffsetSeconds(0);
     }
     @Test
     public void testHandlingOfExtremeOffsetsWithoutOverflows() throws Exception {
@@ -459,6 +543,25 @@ public class HeldOutTimeMechanismTest {
         assertEffectiveOffsetSeconds(0);
         for (int i = scopes.size() - 1; i >= 0; i--) closeQuietly(scopes.get(i));
         assertEffectiveOffsetSeconds(0);
+
+        scopes.clear();
+        long expected = 0;
+        for (int i = 1; i <= 100; i++) {
+            scopes.add(Time.withThreadOffset(i));
+            expected += i;
+        }
+        assertEffectiveOffsetSeconds(expected);
+        for (int i = scopes.size() - 1; i >= 0; i--) closeQuietly(scopes.get(i));
+        assertEffectiveOffsetSeconds(0);
+
+        try (AutoCloseable debug = enableDebug()) {
+            assertThrows(IllegalStateException.class, () -> {
+                for (int i = 0; i < 1001; i++) {
+                    Time.withThreadOffset(0);
+                }
+            });
+        }
+        assertEffectiveOffsetSeconds(0);
     }
     @Test
     public void testRobustHandlingOfExtremeConcurrentAccessesInDeepNests() throws Exception {
@@ -492,16 +595,16 @@ public class HeldOutTimeMechanismTest {
         AutoCloseable a = Time.withThreadOffset(1);
         AutoCloseable b = Time.withThreadOffset(2);
         AutoCloseable c = Time.withThreadOffset(3);
-        try {
-            try { b.close(); } catch (Throwable ignored) {}
-            try { c.close(); } catch (Throwable ignored) {}
-            try { a.close(); } catch (Throwable ignored) {}
-        } finally {
-            closeQuietly(c);
-            closeQuietly(b);
-            closeQuietly(a);
-        }
+        assertEffectiveOffsetSeconds(3);
+        try { b.close(); } catch (Throwable ignored) {}
+        assertEffectiveOffsetSeconds(3);
+        try { c.close(); } catch (Throwable ignored) {}
+        assertEffectiveOffsetSeconds(1);
+        try { a.close(); } catch (Throwable ignored) {}
         assertEffectiveOffsetSeconds(0);
+        closeQuietly(c);
+        closeQuietly(b);
+        closeQuietly(a);
     }
     @Test
     public void testBehavioralConsistencyUnderExtremeOffsetsWithoutLoss() throws Exception {
@@ -540,19 +643,29 @@ public class HeldOutTimeMechanismTest {
     @Test
     public void testSafeguardsEnforceFailuresOnAllInconsistenciesInDebug() throws Exception {
         runInNewThread(() -> {
-            AutoCloseable o1 = Time.withThreadOffset(1);
-            AutoCloseable o2 = Time.withThreadOffset(2);
-            boolean threw = false;
-            try {
-                o1.close(); 
-            } catch (IllegalStateException expected) {
-                threw = true;
-            } finally {
-                closeQuietly(o2);
-                closeQuietly(o1);
+            try (AutoCloseable debug = enableDebug()) {
+                AutoCloseable o1 = Time.withThreadOffset(1);
+                AutoCloseable o2 = Time.withThreadOffset(2);
+                try {
+                    assertThrows(IllegalStateException.class, o1::close);
+                } finally {
+                    closeQuietly(o2);
+                    closeQuietly(o1);
+                }
+                assertEffectiveOffsetSeconds(0);
+
+                o1 = Time.withThreadOffset(1);
+                AutoCloseable o3 = Time.withThreadOffset(3);
+                o2 = Time.withThreadOffset(2);
+                try {
+                    assertThrows(IllegalStateException.class, o1::close);
+                } finally {
+                    closeQuietly(o2);
+                    closeQuietly(o3);
+                    closeQuietly(o1);
+                }
+                assertEffectiveOffsetSeconds(0);
             }
-            assertTrue("Misordered closes must be detected in debug", threw);
-            assertEquals(0L, effectiveOffsetSeconds());
         });
     }
 }
